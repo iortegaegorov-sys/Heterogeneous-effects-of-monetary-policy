@@ -1,0 +1,1311 @@
+---
+title: "Heterogeneous effects of monetary policy in wartime Russia"
+author: "Ivan Ortega"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 12, fig.height = 8, fig.path = "graphs/knit-")
+```
+
+## Reading data
+
+Run from the folder containing this file and the three datasets. Graphs are saved in `graphs/`; regression tests are saved in `results/`. All bands are pointwise 90% intervals. Aggregate regressions use ordinary OLS errors; panel regressions cluster errors by month.
+
+```{r}
+library(dplyr)
+library(readxl)
+library(fixest)
+library(purrr)
+library(broom)
+library(stringr)
+library(ggplot2)
+library(car)
+
+dir.create("graphs", showWarnings = FALSE)
+dir.create("results", showWarnings = FALSE)
+nlag_price <- 2
+nlag_ir <- 2
+nlag_control <- 2
+H <- 24
+confidence <- 0.90
+
+add_lags <- function(data, variables, n = 3) {
+  for (k in seq_len(n)) {
+    data <- data %>% mutate(across(all_of(variables), ~ dplyr::lag(.x, k),
+                                  .names = paste0("{.col}_l", k)))
+  }
+  data
+}
+
+df_agg <- read_excel("aggregate_dataset.xlsx") %>% arrange(month_start)
+stopifnot(!anyDuplicated(df_agg$month_start),
+          all(diff(as.integer(format(df_agg$month_start, "%Y")) * 12 +
+                   as.integer(format(df_agg$month_start, "%m"))) == 1))
+# CPI, aggregate IPI and USDRUB are stored in logs; aggregate PPI is an index.
+df_agg <- df_agg %>%
+  mutate(PPI_agg_MoM = 100 * (log(PPI_agg_levels) - lag(log(PPI_agg_levels))),
+         hse_soi_MoM = 100 * (hse_soi_levels - lag(hse_soi_levels)))
+macro_controls <- c("ctot_export_MoM", "unemp_MoM_SA",
+                    "ip_agg_MoM_SA", "USDRUB_MoM", "CPI_MoM_SA", "PPI_agg_MoM",
+                    "inf_exp_MoM_SA", "inf_exp_firm_levels_SA_real", "hse_soi_MoM")
+df_agg <- add_lags(df_agg, macro_controls)
+explanatory_variables <- c("cbr_ir", grep("roisfix_.*iv$", names(df_agg), value = TRUE))
+alternative_explanatory_variables <- "roisfix_3M_chg"
+
+df_panel <- read_excel("complete_dataset.xlsx") %>% arrange(OKVED2, month_start)
+stopifnot(!anyDuplicated(df_panel[c("OKVED2", "month_start")]))
+monthly_steps <- df_panel %>% group_by(OKVED2) %>%
+  summarise(consecutive = all(diff(as.integer(format(month_start, "%Y")) * 12 +
+                                  as.integer(format(month_start, "%m"))) == 1))
+stopifnot(all(monthly_steps$consecutive))
+# Macro controls are lagged on the full aggregate sample before joining the panel.
+macro_lags <- grep("_l[1-3]$", names(df_agg), value = TRUE)
+df_panel <- left_join(df_panel, select(df_agg, month_start, all_of(macro_lags)), by = "month_start")
+
+sector_names <- read.csv("sector_names.csv", colClasses = c(sector = "character"))
+```
+
+## Preliminary shock checks
+
+```{r}
+i <- explanatory_variables[4]
+  df <- rename(df_agg, "date"=month_start, "dp"=CPI_MoM_SA, "p_levels"=CPI_levels_SA, "di"=all_of(i))
+
+summary(lm(di ~ dplyr::lead(p_levels, 12), df))
+
+summary(lm(di ~ dplyr::lead(p_levels, 12) + inf_exp_MoM_SA + inf_exp_MoM_SA_l1 + inf_exp_MoM_SA_l2 + inf_exp_MoM_SA_l3, df))
+
+summary(lm(di ~ inf_exp_MoM_SA + inf_exp_MoM_SA_l1 + inf_exp_MoM_SA_l2 + inf_exp_MoM_SA_l3, df))
+```
+
+## 1) Preliminary aggregate regressions
+
+```{r}
+dependent <- "CPI"
+change_variable <- "CPI_MoM_SA"
+level_variable <- "CPI_levels_SA"
+irf_w_names <- list()
+mods <- list()
+for (i in explanatory_variables) {
+    df <- df_agg %>% rename(date = month_start, di = all_of(i)) %>%
+      mutate(dp = .data[[change_variable]], p_levels = .data[[level_variable]],
+             di_war = di * war_dummy, di_war_inv = di * (1 - war_dummy)) %>%
+      add_lags(c("dp", "p_levels", "di", "di_war", "di_war_inv"))
+
+    estimate_lp <- function(h) {
+
+        d <- df %>%
+          mutate(dp_lead = dplyr::lead(p_levels, h)) %>%
+          mutate(dp_longdif = 100 * (dp_lead - p_levels_l1)) %>%
+          rename("di_main"=di) %>%
+        filter(!is.na(dp_lead))
+
+        fml <- as.formula(paste0(
+        "dp_longdif ~ di_main + ",
+        paste0("dp_l", 1:nlag_price, collapse = " + "), " + ",
+        paste0("di_l", 1:nlag_ir, collapse = " + "), " + ",
+
+        paste0("ctot_export_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("unemp_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("ip_agg_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("USDRUB_MoM_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("inf_exp_firm_levels_SA_real_l", 1:nlag_control, collapse = " + ")
+        ))
+
+      lm(fml, data = d)
+    }
+    mods[[i]] <- setNames(map(0:H, estimate_lp), 0:H)
+
+    irf <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level = confidence) %>%
+        filter(str_detect(term, "di_main")) %>%
+        mutate(
+          h = h
+        ) %>%
+        select(h, estimate, conf.low, conf.high)
+    })
+    irf_w_names[[i]] <- irf
+
+}
+  for (i in explanatory_variables) {
+    a <- summary(mods[[i]][[as.character(H)]])
+    print(a)
+  }
+
+  for (i in explanatory_variables) {
+    a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    labs(x = "Horizon (months)", y = "Cumulative price response (%)", title = paste("Aggregate CPI response:", i))
+    print(a)
+    ggsave(paste0("graphs/",dependent,"_aggregate_preliminary_",i,".png"), a, width = 12, height = 8, dpi = 150)
+  }
+```
+
+## 2.1) One-stage aggregate regressions
+
+```{r}
+for (dependent in c("CPI", "PPI", "IPI", "FX")) {
+  change_variable <- switch(dependent, CPI = "CPI_MoM_SA", PPI = "PPI_agg_MoM",
+                            IPI = "ip_agg_MoM_SA", FX = "USDRUB_MoM")
+  level_variable <- switch(dependent, CPI = "CPI_levels_SA", PPI = "PPI_agg_levels",
+                           IPI = "ip_agg_levels_SA", FX = "USDRUB_levels")
+irf_w_names <- list()
+mods <- list()
+for (i in alternative_explanatory_variables) {
+    df <- df_agg %>% rename(date = month_start, di = all_of(i)) %>%
+      mutate(dp = .data[[change_variable]], p_levels = if (dependent == "PPI") log(.data[[level_variable]]) else .data[[level_variable]],
+             di_war = di * war_dummy, di_war_inv = di * (1 - war_dummy)) %>%
+      add_lags(c("dp", "p_levels", "di", "di_war", "di_war_inv"))
+
+    estimate_lp <- function(h) {
+
+        d <- df %>%
+          mutate(dp_lead = dplyr::lead(p_levels, h)) %>%
+          mutate(dp_longdif = 100 * (dp_lead - p_levels_l1)) %>%
+          rename("di_main"=di) %>%
+        filter(!is.na(dp_lead))
+
+        fml <- as.formula(paste0(
+        "dp_longdif ~ di_main + inf_exp_MoM_SA + ",
+
+        if (dependent == "CPI") paste0(paste0("dp_l", 1:nlag_price, collapse = " + "), " + ") else "",
+        paste0("di_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("ctot_export_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("unemp_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("ip_agg_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("PPI_agg_MoM_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("USDRUB_MoM_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("inf_exp_MoM_SA_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("hse_soi_MoM_l", 1:nlag_control, collapse = " + ")
+        ))
+
+      lm(fml, data = d)
+    }
+    mods[[i]] <- setNames(map(0:H, estimate_lp), 0:H)
+
+    irf <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, "di_main")) %>%
+        mutate(
+          h = h
+        ) %>%
+        select(h, estimate, conf.low, conf.high)
+    })
+    irf_w_names[[i]] <- irf
+
+}
+  for (i in alternative_explanatory_variables) {
+    a <- summary(mods[[i]][[as.character(H)]])
+    print(a)
+  }
+
+  for (i in alternative_explanatory_variables) {
+    a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    labs(x = "Horizon (months)", y =paste0("Cumulative ", dependent, " response (%)"))
+    print(a)
+    ggsave(paste0("graphs/",dependent,"_aggregate_",i,".png"), a, width = 12, height = 8, dpi = 150)
+  }
+
+}
+```
+
+## 2.2) Aggregate regressions before and after the war
+
+```{r}
+for (dependent in c("CPI", "PPI", "IPI", "FX")) {
+  change_variable <- switch(dependent, CPI = "CPI_MoM_SA", PPI = "PPI_agg_MoM",
+                            IPI = "ip_agg_MoM_SA", FX = "USDRUB_MoM")
+  level_variable <- switch(dependent, CPI = "CPI_levels_SA", PPI = "PPI_agg_levels",
+                           IPI = "ip_agg_levels_SA", FX = "USDRUB_levels")
+irf_w_names <- list()
+mods <- list()
+for (i in alternative_explanatory_variables) {
+    df <- df_agg %>% rename(date = month_start, di = all_of(i)) %>%
+      mutate(dp = .data[[change_variable]], p_levels = if (dependent == "PPI") log(.data[[level_variable]]) else .data[[level_variable]],
+             di_war = di * war_dummy, di_war_inv = di * (1 - war_dummy)) %>%
+      add_lags(c("dp", "p_levels", "di", "di_war", "di_war_inv"))
+
+    estimate_lp <- function(h) {
+
+        d <- df %>%
+          mutate(dp_lead = dplyr::lead(p_levels, h)) %>%
+          mutate(dp_longdif = 100 * (dp_lead - p_levels_l1)) %>%
+        filter(!is.na(dp_lead))
+
+        fml <- as.formula(paste0(
+        "dp_longdif ~ di_war + di_war_inv + inf_exp_MoM_SA + ",
+        if (dependent == "CPI") paste0(paste0("dp_l", 1:nlag_price, collapse = " + "), " + ") else "",
+        paste0("di_war_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("di_war_inv_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("ctot_export_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("unemp_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("ip_agg_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("PPI_agg_MoM_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("USDRUB_MoM_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("inf_exp_MoM_SA_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("hse_soi_MoM_l", 1:nlag_control, collapse = " + ")
+        ))
+
+      lm(fml, data = d)
+    }
+    mods[[i]] <- setNames(map(0:H, estimate_lp), 0:H)
+
+    irf_di <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, "di_war_inv$")) %>%   # sector-specific di coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, "di_war_inv")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=0)
+    })
+
+    irf_di_int <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, "di_war$")) %>%   # sector-specific di_int coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, "di_war")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=1)
+    })
+    irf_w_names[[i]] <- rbind(irf_di,irf_di_int)
+
+}
+  for (i in alternative_explanatory_variables) {
+    a <- summary(mods[[i]][[as.character(H)]])
+    print(a)
+  }
+
+  for (i in alternative_explanatory_variables) {
+    a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate, color=factor(post2022), fill=factor(post2022))) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    labs(x = "Horizon (months)", y = paste0("Cumulative ", dependent, " response (%)")) +
+    theme(legend.position = "bottom") +
+    scale_fill_manual(values = c("0" = "green", "1" = "darkblue"),
+                      labels = c("Before March 2022", "March 2022 onward"), name = NULL) +
+    scale_color_manual(
+      name = NULL, labels = c("Before March 2022", "March 2022 onward"),
+      values = c(
+        "0" = "green",
+        "1" = "darkblue"
+      )
+    )
+    print(a)
+    ggsave(paste0("graphs/",dependent,"_aggregate_war_dummy_",i,".png"), a, width = 12, height = 8, dpi = 150)
+  }
+
+}
+```
+
+## 3) Simple panel LPs
+
+```{r}
+for (dependent in c("PPI", "IPI")) {
+  df_main <- df_panel %>% rename(sector = OKVED2, date = month_start) %>%
+    mutate(dp = if (dependent == "PPI") ppi_MoM else IP_MoM,
+           p_levels = if (dependent == "PPI") log(ppi_levels) else log(IP_levels))
+irf_w_names <- list()
+mods <- list()
+  for (i in alternative_explanatory_variables) {
+    df <- rename(df_main, di = all_of(i))
+
+    df <- df %>% arrange(sector, date) %>% group_by(sector) %>%
+      mutate(di_war = di * war_dummy, di_war_inv = di * (1 - war_dummy),
+             USDRUB_MoM_int = USDRUB_MoM * war_dummy,
+             wage_MoM = 100 * (log(wage_nominal) - lag(log(wage_nominal))),
+             wage_MoM_int = wage_MoM * war_dummy) %>%
+      add_lags(c("dp", "p_levels", "di", "di_war", "di_war_inv",
+                 "ppi_MoM", "IP_MoM", "USDRUB_MoM_int", "wage_MoM", "wage_MoM_int")) %>%
+      ungroup()
+
+    estimate_lp <- function(h) {
+        d <- df %>%
+        group_by(sector) %>%
+        mutate(dp_lead = dplyr::lead(p_levels, h)) %>%
+        mutate(dp_longdif = 100 * (dp_lead - p_levels_l1)) %>%
+        ungroup() %>%
+        filter(!is.na(dp_lead))
+
+        fml <- as.formula(paste0(
+        "dp_longdif ~ i(sector,di) + inf_exp_MoM_SA + ",
+
+        paste0("di_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("ctot_export_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("unemp_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("inf_exp_MoM_SA_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("USDRUB_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("ppi_MoM_l", 1:nlag_price, collapse = " + "), " + ",
+        paste0("IP_MoM_l", 1:nlag_control, collapse = " + "),
+        " | sector + month_name"
+        ))
+
+      feols(fml, data = d, vcov = ~ date)
+    }
+
+    H <- 24 # e.g., 2 years
+    mods[[i]] <- setNames(map(0:H, estimate_lp), 0:H)
+
+    irf_di <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di")) %>%   # sector-specific di coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=0)
+    })
+
+    sector_names <- read.csv("sector_names.csv", colClasses = c(sector = "character"))
+
+    irf_di$sector <- substr(irf_di$sector,str_locate(irf_di$sector,"::")[,2]+1,str_length(irf_di$sector))
+    irf_w_names[[i]] <- merge(irf_di,sector_names,by = "sector") %>%
+      mutate(sector=as.numeric(sector))
+  }
+
+  for (i in alternative_explanatory_variables) {
+    a <- summary(mods[[i]][["24"]])
+    print(a)
+  }
+
+for (i in alternative_explanatory_variables) {
+  a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    facet_wrap(~ sector_short) +
+    labs(x = "Horizon (months)", y = paste0("Cumulative ", dependent, " response (%)")) +
+    scale_y_continuous(breaks = c(-6, 0, 6)) +
+    theme(
+      axis.text.x = element_text(size = 6),
+      axis.text.y = element_text(size = 6)
+    )
+    print(a)
+    ggsave(paste0("graphs/",dependent,"_sector_main_short_",i,".png"), a, width = 12, height = 8, dpi = 150)
+  }
+
+division <- list(c(0,13),c(13,21),c(21,29),c(29,60))
+for (i in alternative_explanatory_variables) {
+  for (j in c(1:4)) {
+    irf <- irf_w_names[[i]] %>%
+    mutate(sector=as.numeric(sector)) %>%
+    filter(sector>division[[j]][1] & sector<=division[[j]][2])
+  a <- ggplot(irf, aes(x = h, y = estimate)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    facet_wrap(~ sector_short,ncol=4) +
+    labs(x = "Horizon (months)", y = paste0("Cumulative ", dependent, " response (%)")) +
+    scale_y_continuous(breaks = c(-10, -5, 0, 5, 10)) +
+    theme(
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10)
+    )
+    print(a)
+    ggsave(paste0("graphs/",dependent,"_sector_main_",i,"_",j,".png"), a, width = 12, height = 8, dpi = 150)
+  }
+
+  }
+
+irf_25bp <- list()
+irf_std <- list()
+
+  for (i in alternative_explanatory_variables) {
+
+    sector_sd <- aggregate(dp ~ sector, df_main, FUN = sd) %>%
+      rename(sector_sd = dp)
+    sector_sd$sector <- as.numeric(sector_sd$sector)
+
+shock_size <- 0.25  # if di is in percentage points
+
+    irf_25bp[[i]] <- irf_w_names[[i]] %>%
+      mutate(
+        estimate = estimate * shock_size,
+        conf.low = conf.low * shock_size,
+        conf.high = conf.high * shock_size
+      )
+
+irf_std[[i]] <- irf_25bp[[i]] %>%
+  left_join(sector_sd, by = "sector") %>%
+  mutate(
+    estimate_sd = estimate / sector_sd,
+    conf.low_sd = conf.low / sector_sd,
+    conf.high_sd = conf.high / sector_sd
+  )
+
+  }
+
+  for (i in alternative_explanatory_variables) {
+    a <- ggplot(irf_std[[i]], aes(x = h, y = estimate_sd)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low_sd, ymax = conf.high_sd), alpha = 0.2) +
+    facet_wrap(~ sector_short) +
+    labs(x = "Horizon (months)", y = "Response / SD of monthly growth", title = "Responses to a 25 bp shock")
+    print(a)
+    ggsave(paste0("graphs/", dependent, "_sector_standardised_", i, ".png"), a, width = 12, height = 8, dpi = 150)
+  }
+
+for (i in alternative_explanatory_variables) {
+  heterogeneity_tests <- map_dfr(0:H, function(h) {
+    m <- mods[[i]][[as.character(h)]]
+    terms <- grep(":di$", names(coef(m)), value = TRUE)
+    R <- matrix(0, nrow = length(terms) - 1, ncol = length(coef(m)),
+                dimnames = list(NULL, names(coef(m))))
+    R[, terms[1]] <- -1
+    for (j in seq_len(nrow(R))) R[j, terms[j + 1]] <- 1
+    test <- linearHypothesis(m, R, vcov. = vcov(m), test = "Chisq")
+    data.frame(h = h, statistic = test$Chisq[2], p_value = test$`Pr(>Chisq)`[2])
+  })
+  write.csv(heterogeneity_tests, paste0("results/", dependent, "_sector_heterogeneity_", i, ".csv"), row.names = FALSE)
+}
+
+for (i in alternative_explanatory_variables) {
+  a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    facet_wrap(~ sector) +
+    labs(x = "Horizon (months)", y = paste0("Cumulative ", dependent, " response (%)")) +
+    scale_y_continuous(breaks = c(-6, 0, 6)) +
+    theme(
+      axis.text.x = element_text(size = 6),
+      axis.text.y = element_text(size = 6)
+    )
+    print(a)
+    ggsave(paste0("graphs/",dependent,"_sector_main_",i,".png"), a, width = 12, height = 8, dpi = 150)
+}
+
+for (i in alternative_explanatory_variables) {
+    a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    facet_wrap(~ sector) +
+    labs(x = "Horizon (months)", y = "Cumulative response (%)", title = paste0("Panel local projections: sector IRFs with surprise: ", i))
+    print(a)
+    ggsave(paste0("graphs/", dependent, "_sector_main_titled_", i, ".png"), a, width = 12, height = 8, dpi = 150)
+  }
+}
+```
+
+## 4.1) Broad sectors
+
+```{r}
+for (dependent in c("PPI", "IPI")) {
+  df_main <- df_panel %>% rename(sector = OKVED2, date = month_start) %>%
+    mutate(dp = if (dependent == "PPI") ppi_MoM else IP_MoM,
+           p_levels = if (dependent == "PPI") log(ppi_levels) else log(IP_levels))
+irf <- list()
+irf_w_names <- list()
+mods <- list()
+
+for (i in alternative_explanatory_variables) {
+
+    df <- rename(df_main, di = all_of(i))
+    df <- df %>% arrange(sector, date) %>% group_by(sector) %>%
+      mutate(di_war = di * war_dummy, di_war_inv = di * (1 - war_dummy),
+             USDRUB_MoM_int = USDRUB_MoM * war_dummy,
+             wage_MoM = 100 * (log(wage_nominal) - lag(log(wage_nominal))),
+             wage_MoM_int = wage_MoM * war_dummy) %>%
+      add_lags(c("dp", "p_levels", "di", "di_war", "di_war_inv",
+                 "ppi_MoM", "IP_MoM", "USDRUB_MoM_int", "wage_MoM", "wage_MoM_int")) %>%
+      ungroup()
+
+    estimate_lp <- function(h) {
+        d <- df %>%
+        group_by(sector) %>%
+        mutate(dp_lead = dplyr::lead(p_levels, h)) %>%
+        mutate(dp_longdif = 100 * (dp_lead - p_levels_l1)) %>%
+        ungroup() %>%
+        filter(!is.na(dp_lead))
+
+        fml <- as.formula(paste0(
+        "dp_longdif ~ i(`Durable / non-durable / raw / utilities`,di) + inf_exp_MoM_SA + ",
+
+        paste0("di_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("ctot_export_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("unemp_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("inf_exp_MoM_SA_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("USDRUB_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("ppi_MoM_l", 1:nlag_price, collapse = " + "), " + ",
+        paste0("IP_MoM_l", 1:nlag_control, collapse = " + "),
+        " | sector + month_name"
+        ))
+
+      feols(fml, data = d, vcov = ~ date)
+    }
+
+    H <- 24 # e.g., 2 years
+    mods[[i]] <- setNames(map(0:H, estimate_lp), 0:H)
+
+    irf_di <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di")) %>%   # sector-specific di coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high)
+    })
+
+    irf_di$sector <- substr(irf_di$sector,str_locate(irf_di$sector,"::")[,2]+1,str_length(irf_di$sector))
+    irf_w_names[[i]] <- irf_di
+}
+
+for (i in alternative_explanatory_variables) {
+    a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    facet_wrap(~ sector) +
+    labs(x = "Horizon (months)", y = paste0("Cumulative ", dependent, " response (%)")) +
+    theme(legend.position = "bottom")  +
+    theme(
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10)
+    )
+    print(a)
+    ggsave(paste0("graphs/",dependent,"_sector_durable_",i,".png"), a, width = 12, height = 8, dpi = 150)
+}
+
+for (i in alternative_explanatory_variables) {
+  m <- mods[[i]][["24"]]
+  b <- names(coef(m))
+  comparisons <- c("durable", "raw")
+  tests <- lapply(comparisons, function(group) {
+    R <- matrix(0, 1, length(b), dimnames = list(NULL, b))
+    R[1, grep(paste0("::", group, ":di$"), b)] <- 1
+    R[1, grep("::nondurable:di$", b)] <- -1
+    linearHypothesis(m, R, vcov. = vcov(m), test = "Chisq")
+  })
+  capture.output(tests, file = paste0("results/", dependent, "_durable_tests_", i, ".txt"))
+}
+
+}
+```
+
+## 4.2) Sector responses before and after the war
+
+```{r}
+for (dependent in c("PPI", "IPI")) {
+  df_main <- df_panel %>% rename(sector = OKVED2, date = month_start) %>%
+    mutate(dp = if (dependent == "PPI") ppi_MoM else IP_MoM,
+           p_levels = if (dependent == "PPI") log(ppi_levels) else log(IP_levels))
+
+irf <- list()
+irf_w_names <- list()
+mods <- list()
+
+  for (i in alternative_explanatory_variables) {
+
+    df <- rename(df_main, di = all_of(i))
+    df <- df %>% arrange(sector, date) %>% group_by(sector) %>%
+      mutate(di_war = di * war_dummy, di_war_inv = di * (1 - war_dummy),
+             USDRUB_MoM_int = USDRUB_MoM * war_dummy,
+             wage_MoM = 100 * (log(wage_nominal) - lag(log(wage_nominal))),
+             wage_MoM_int = wage_MoM * war_dummy) %>%
+      add_lags(c("dp", "p_levels", "di", "di_war", "di_war_inv",
+                 "ppi_MoM", "IP_MoM", "USDRUB_MoM_int", "wage_MoM", "wage_MoM_int")) %>%
+      ungroup()
+
+    estimate_lp <- function(h) {
+        d <- df %>%
+        group_by(sector) %>%
+        mutate(dp_lead = dplyr::lead(p_levels, h)) %>%
+        mutate(dp_longdif = 100 * (dp_lead - p_levels_l1)) %>%
+        ungroup() %>%
+        filter(!is.na(dp_lead))
+
+        fml <- as.formula(paste0(
+        "dp_longdif ~ i(sector,di_war_inv) + i(sector,di_war) + inf_exp_MoM_SA + ",
+
+        paste0("di_war_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("di_war_inv_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("ctot_export_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("unemp_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("inf_exp_MoM_SA_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("USDRUB_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("USDRUB_MoM_int_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("ppi_MoM_l", 1:nlag_price, collapse = " + "), " + ",
+        paste0("IP_MoM_l", 1:nlag_control, collapse = " + "),
+        " | sector^war_dummy + month_name"
+        ))
+
+      feols(fml, data = d, vcov = ~ date)
+    }
+
+    H <- 24 # e.g., 2 years
+    mods[[i]] <- setNames(map(0:H, estimate_lp), 0:H)
+
+    irf_di <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di_war_inv")) %>%   # sector-specific di coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di_war_inv")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=0)
+    })
+
+    irf_di_int <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di_war$")) %>%   # sector-specific di_int coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di_war")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=1)
+    })
+
+    sector_names <- read.csv("sector_names.csv", colClasses = c(sector = "character"))
+
+    irf_di$sector <- substr(irf_di$sector,str_locate(irf_di$sector,"::")[,2]+1,str_length(irf_di$sector))
+    irf_di_int$sector <- substr(irf_di_int$sector,str_locate(irf_di_int$sector,"::")[,2]+1,str_length(irf_di_int$sector))
+    irf_w_names[[i]] <- merge(irf_di,sector_names,by = "sector") %>%
+      rbind(merge(irf_di_int,sector_names,by = "sector"))
+  }
+
+for (i in alternative_explanatory_variables) {
+    a <- summary(mods[[i]][["24"]])
+    print(a)
+}
+
+for (i in alternative_explanatory_variables) {
+    a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate, color=factor(post2022), fill=factor(post2022))) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    facet_wrap(~ sector_short) +
+    labs(x = "Horizon (months)", y = paste0("Cumulative ", dependent, " response (%)")) +
+    theme(legend.position = "bottom")  +
+    theme(
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10)
+    ) +
+    scale_fill_manual(values = c("0" = "green", "1" = "darkblue"),
+                      labels = c("Before March 2022", "March 2022 onward"), name = NULL) +
+    scale_color_manual(
+      name = NULL, labels = c("Before March 2022", "March 2022 onward"),
+      values = c(
+        "0" = "green",
+        "1" = "darkblue"
+      )
+    )
+    print(a)
+    ggsave(paste0("graphs/", dependent, "_sector_war_dummy_", i, ".png"), a, width = 12, height = 8, dpi = 150)
+
+}
+
+division <- list(c(0,13),c(13,21),c(21,29),c(29,60))
+for (i in alternative_explanatory_variables) {
+  for (j in c(1:4)) {
+    irf <- irf_w_names[[i]] %>%
+    mutate(sector=as.numeric(sector)) %>%
+    filter(sector>division[[j]][1] & sector<=division[[j]][2])
+  a <- ggplot(irf, aes(x = h, y = estimate,color=factor(post2022), fill=factor(post2022))) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    facet_wrap(~ sector_short,ncol=4) +
+    labs(x = "Horizon (months)", y = paste0("Cumulative ", dependent, " response (%)")) +
+    scale_y_continuous(breaks = c(-10, -5, 0, 5, 10)) +
+    theme(legend.position = "bottom")  +
+    theme(
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10)
+    )  +
+    scale_fill_manual(values = c("0" = "green", "1" = "darkblue"),
+                      labels = c("Before March 2022", "March 2022 onward"), name = NULL) +
+    scale_color_manual(
+      name = NULL, labels = c("Before March 2022", "March 2022 onward"),
+      values = c(
+        "0" = "green",
+        "1" = "darkblue"
+      )
+    )
+    print(a)
+    ggsave(paste0("graphs/",dependent,"_sector_war_dummy_",i,"_",j,".png"), a, width = 12, height = 8, dpi = 150)
+  }
+
+  }
+
+}
+```
+
+## 4.3) Broad sectors before and after the war
+
+```{r}
+for (dependent in c("PPI", "IPI")) {
+  df_main <- df_panel %>% rename(sector = OKVED2, date = month_start) %>%
+    mutate(dp = if (dependent == "PPI") ppi_MoM else IP_MoM,
+           p_levels = if (dependent == "PPI") log(ppi_levels) else log(IP_levels))
+
+irf <- list()
+irf_w_names <- list()
+mods <- list()
+
+  for (i in alternative_explanatory_variables) {
+
+    df <- rename(df_main, di = all_of(i))
+    df <- df %>% arrange(sector, date) %>% group_by(sector) %>%
+      mutate(di_war = di * war_dummy, di_war_inv = di * (1 - war_dummy),
+             USDRUB_MoM_int = USDRUB_MoM * war_dummy,
+             wage_MoM = 100 * (log(wage_nominal) - lag(log(wage_nominal))),
+             wage_MoM_int = wage_MoM * war_dummy) %>%
+      add_lags(c("dp", "p_levels", "di", "di_war", "di_war_inv",
+                 "ppi_MoM", "IP_MoM", "USDRUB_MoM_int", "wage_MoM", "wage_MoM_int")) %>%
+      ungroup()
+
+    estimate_lp <- function(h) {
+        d <- df %>%
+        group_by(sector) %>%
+        mutate(dp_lead = dplyr::lead(p_levels, h)) %>%
+        mutate(dp_longdif = 100 * (dp_lead - p_levels_l1)) %>%
+        ungroup() %>%
+        filter(!is.na(dp_lead))
+
+        fml <- as.formula(paste0(
+        "dp_longdif ~ i(`Durable / non-durable / raw / utilities`,di_war_inv) + i(`Durable / non-durable / raw / utilities`,di_war) + inf_exp_MoM_SA + ",
+
+        paste0("di_war_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("di_war_inv_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("ctot_export_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("unemp_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("inf_exp_MoM_SA_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("USDRUB_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("USDRUB_MoM_int_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("ppi_MoM_l", 1:nlag_price, collapse = " + "), " + ",
+        paste0("IP_MoM_l", 1:nlag_control, collapse = " + "),
+        " | sector^war_dummy + month_name"
+        ))
+
+      feols(fml, data = d, vcov = ~ date)
+    }
+
+    H <- 24 # e.g., 2 years
+    mods[[i]] <- setNames(map(0:H, estimate_lp), 0:H)
+
+    irf_di <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di_war_inv")) %>%   # sector-specific di coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di_war_inv")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=0)
+    })
+
+    irf_di_int <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di_war$")) %>%   # sector-specific di_int coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di_war")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=1)
+    })
+
+    sector_names <- read.csv("sector_names.csv", colClasses = c(sector = "character"))
+
+    irf_di$sector <- substr(irf_di$sector,str_locate(irf_di$sector,"::")[,2]+1,str_length(irf_di$sector))
+    irf_di_int$sector <- substr(irf_di_int$sector,str_locate(irf_di_int$sector,"::")[,2]+1,str_length(irf_di_int$sector))
+    irf_w_names[[i]] <- irf_di %>%
+      rbind(irf_di_int)
+  }
+
+for (i in alternative_explanatory_variables) {
+    a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate, color=factor(post2022), fill=factor(post2022))) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    facet_wrap(~ sector) +
+    theme(legend.position = "bottom")  +
+    labs(x = "Horizon (months)", y = paste0("Cumulative ", dependent, " response (%)")) +
+    theme(legend.position = "bottom")  +
+    theme(
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10)
+    ) +
+    scale_fill_manual(values = c("0" = "green", "1" = "darkblue"),
+                      labels = c("Before March 2022", "March 2022 onward"), name = NULL) +
+    scale_color_manual(
+      name = NULL, labels = c("Before March 2022", "March 2022 onward"),
+      values = c(
+        "0" = "green",
+        "1" = "darkblue"
+      )
+    )
+    print(a)
+    ggsave(paste0("graphs/",dependent,"_sector_durable_war_",i,".png"), a, width = 12, height = 8, dpi = 150)
+  }
+}
+```
+
+## 4.4) Controlling for wages
+
+```{r}
+for (dependent in c("PPI", "IPI")) {
+  df_main <- df_panel %>% rename(sector = OKVED2, date = month_start) %>%
+    mutate(dp = if (dependent == "PPI") ppi_MoM else IP_MoM,
+           p_levels = if (dependent == "PPI") log(ppi_levels) else log(IP_levels))
+irf_di <- list()
+irf_w_names <- list()
+mods <- list()
+
+  for (i in alternative_explanatory_variables) {
+
+    df <- rename(df_main, di = all_of(i))
+    df <- df %>% arrange(sector, date) %>% group_by(sector) %>%
+      mutate(di_war = di * war_dummy, di_war_inv = di * (1 - war_dummy),
+             USDRUB_MoM_int = USDRUB_MoM * war_dummy,
+             wage_MoM = 100 * (log(wage_nominal) - lag(log(wage_nominal))),
+             wage_MoM_int = wage_MoM * war_dummy) %>%
+      add_lags(c("dp", "p_levels", "di", "di_war", "di_war_inv",
+                 "ppi_MoM", "IP_MoM", "USDRUB_MoM_int", "wage_MoM", "wage_MoM_int")) %>%
+      ungroup()
+
+    estimate_lp <- function(h) {
+        d <- df %>%
+        group_by(sector) %>%
+        mutate(dp_lead = dplyr::lead(p_levels, h)) %>%
+        mutate(dp_longdif = 100 * (dp_lead - p_levels_l1)) %>%
+        ungroup() %>%
+        filter(!is.na(dp_lead))
+
+        fml <- as.formula(paste0(
+        "dp_longdif ~ i(sector,di_war_inv) + i(sector,di_war) + inf_exp_MoM_SA + ",
+
+        paste0("di_war_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("di_war_inv_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("ctot_export_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("unemp_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("inf_exp_MoM_SA_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("USDRUB_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("USDRUB_MoM_int_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("wage_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("wage_MoM_int_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("ppi_MoM_l", 1:nlag_price, collapse = " + "), " + ",
+        paste0("IP_MoM_l", 1:nlag_control, collapse = " + "),
+        " | sector^war_dummy + month_name"
+        ))
+
+      feols(fml, data = d, vcov = ~ date)
+    }
+
+    H <- 24 # e.g., 2 years
+    mods[[i]] <- setNames(map(0:H, estimate_lp), 0:H)
+
+    irf_di <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di_war_inv")) %>%   # sector-specific di coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di_war_inv")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=0)
+    })
+
+    irf_di_int <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di_war$")) %>%   # sector-specific di_int coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di_war")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=1)
+    })
+
+    sector_names <- read.csv("sector_names.csv", colClasses = c(sector = "character"))
+
+    irf_di$sector <- substr(irf_di$sector,str_locate(irf_di$sector,"::")[,2]+1,str_length(irf_di$sector))
+    irf_di_int$sector <- substr(irf_di_int$sector,str_locate(irf_di_int$sector,"::")[,2]+1,str_length(irf_di_int$sector))
+    irf_w_names[[i]] <- merge(irf_di,sector_names,by = "sector") %>%
+      rbind(merge(irf_di_int,sector_names,by = "sector"))
+  }
+
+for (i in alternative_explanatory_variables) {
+    a <- summary(mods[[i]][["24"]])
+    print(a)
+}
+
+for (i in alternative_explanatory_variables) {
+    a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate, color=factor(post2022), fill=factor(post2022))) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    facet_wrap(~ sector_short) +
+    theme(legend.position = "bottom")  +
+    labs(x = "Horizon (months)", y = paste0("Cumulative ", dependent, " response (%)")) +
+    theme(legend.position = "bottom")  +
+    theme(
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10)
+    ) +
+    scale_fill_manual(values = c("0" = "green", "1" = "darkblue"),
+                      labels = c("Before March 2022", "March 2022 onward"), name = NULL) +
+    scale_color_manual(
+      name = NULL, labels = c("Before March 2022", "March 2022 onward"),
+      values = c(
+        "0" = "green",
+        "1" = "darkblue"
+      )
+    )
+    print(a)
+    ggsave(paste0("graphs/",dependent,"_sector_wages",i,".png"), a, width = 12, height = 8, dpi = 150)
+  }
+}
+```
+
+## 4.5) Sanctions exposure
+
+```{r}
+for (dependent in c("PPI", "IPI")) {
+  df_main <- df_panel %>% rename(sector = OKVED2, date = month_start) %>%
+    mutate(dp = if (dependent == "PPI") ppi_MoM else IP_MoM,
+           p_levels = if (dependent == "PPI") log(ppi_levels) else log(IP_levels))
+
+irf <- list()
+irf_w_names <- list()
+mods <- list()
+
+  for (i in alternative_explanatory_variables) {
+    df <- rename(df_main,"sanctions" = sanctions_continuous,"di"=all_of(i))
+    df <- df %>% arrange(sector, date) %>% group_by(sector) %>%
+      mutate(di_war = di * war_dummy, di_war_inv = di * (1 - war_dummy),
+             USDRUB_MoM_int = USDRUB_MoM * war_dummy,
+             wage_MoM = 100 * (log(wage_nominal) - lag(log(wage_nominal))),
+             wage_MoM_int = wage_MoM * war_dummy) %>%
+      add_lags(c("dp", "p_levels", "di", "di_war", "di_war_inv",
+                 "ppi_MoM", "IP_MoM", "USDRUB_MoM_int", "wage_MoM", "wage_MoM_int")) %>%
+      ungroup() %>% filter(sector != 29, sector != 16)
+
+    estimate_lp <- function(h) {
+        d <- df %>%
+        group_by(sector) %>%
+        mutate(dp_lead = dplyr::lead(p_levels, h)) %>%
+        mutate(dp_longdif = 100 * (dp_lead - p_levels_l1)) %>%
+        ungroup() %>%
+        filter(!is.na(dp_lead))
+
+        fml <- as.formula(paste0(
+        "dp_longdif ~ inf_exp_MoM_SA + ",
+
+        "i(sanctions_factor,di_war_inv) + i(sanctions_factor,di_war) + ",
+
+        paste0("di_war_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("di_war_inv_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("ctot_export_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("unemp_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("inf_exp_MoM_SA_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("USDRUB_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("USDRUB_MoM_int_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("ppi_MoM_l", 1:nlag_price, collapse = " + "), " + ",
+        paste0("IP_MoM_l", 1:nlag_control, collapse = " + "),
+        " | sector^war_dummy + month_name"
+        ))
+
+      feols(fml, data = d, vcov = ~ date)
+    }
+
+    H <- 24 # e.g., 2 years
+    mods[[i]] <- setNames(map(0:H, estimate_lp), 0:H)
+
+    irf_di <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di_war_inv")) %>%   # sector-specific di coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di_war_inv")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=0)
+    })
+
+    irf_di_int <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di_war$")) %>%   # sector-specific di_int coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di_war")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=1)
+    })
+
+    irf_di$sector <- substr(irf_di$sector,str_locate(irf_di$sector,"::")[,2]+1,str_length(irf_di$sector))
+    irf_di_int$sector <- substr(irf_di_int$sector,str_locate(irf_di_int$sector,"::")[,2]+1,str_length(irf_di_int$sector))
+    irf_w_names[[i]] <- irf_di %>%
+      rbind(irf_di_int)
+  }
+
+for (i in alternative_explanatory_variables) {
+    a <- summary(mods[[i]][["24"]])
+    print(a)
+}
+
+for (i in alternative_explanatory_variables) {
+    a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate, color=factor(post2022), fill=factor(post2022))) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    facet_wrap(~ sector) +
+    theme(legend.position = "bottom")  +
+    labs(x = "Horizon (months)", y = paste0("Cumulative ", dependent, " response (%)")) +
+    theme(legend.position = "bottom")  +
+    theme(
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10)
+    ) +
+    scale_fill_manual(values = c("0" = "green", "1" = "darkblue"),
+                      labels = c("Before March 2022", "March 2022 onward"), name = NULL) +
+    scale_color_manual(
+      name = NULL, labels = c("Before March 2022", "March 2022 onward"),
+      values = c(
+        "0" = "green",
+        "1" = "darkblue"
+      )
+    )
+    print(a)
+    ggsave(paste0("graphs/",dependent,"_sector_sanctions_",i,".png"), a, width = 12, height = 8, dpi = 150)
+  }
+}
+```
+
+## 4.6) War-related industries
+
+```{r}
+for (dependent in c("PPI", "IPI")) {
+  df_main <- df_panel %>% rename(sector = OKVED2, date = month_start) %>%
+    mutate(dp = if (dependent == "PPI") ppi_MoM else IP_MoM,
+           p_levels = if (dependent == "PPI") log(ppi_levels) else log(IP_levels))
+
+irf <- list()
+irf_w_names <- list()
+mods <- list()
+
+  for (i in alternative_explanatory_variables) {
+    df <- rename(df_main, di = all_of(i))
+    df <- df %>% arrange(sector, date) %>% group_by(sector) %>%
+      mutate(di_war = di * war_dummy, di_war_inv = di * (1 - war_dummy),
+             USDRUB_MoM_int = USDRUB_MoM * war_dummy,
+             wage_MoM = 100 * (log(wage_nominal) - lag(log(wage_nominal))),
+             wage_MoM_int = wage_MoM * war_dummy) %>%
+      add_lags(c("dp", "p_levels", "di", "di_war", "di_war_inv",
+                 "ppi_MoM", "IP_MoM", "USDRUB_MoM_int", "wage_MoM", "wage_MoM_int")) %>%
+      ungroup() %>% filter(sector != 29)
+
+    estimate_lp <- function(h) {
+        d <- df %>%
+        group_by(sector) %>%
+        mutate(dp_lead = dplyr::lead(p_levels, h)) %>%
+        mutate(dp_longdif = 100 * (dp_lead - p_levels_l1)) %>%
+        ungroup() %>%
+        filter(!is.na(dp_lead))
+
+        fml <- as.formula(paste0(
+        "dp_longdif ~ inf_exp_MoM_SA + ",
+        "i(war_related,di_war_inv) + i(war_related,di_war) + ",
+
+        paste0("di_war_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("di_war_inv_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("ctot_export_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("unemp_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("inf_exp_MoM_SA_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("USDRUB_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("USDRUB_MoM_int_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("ppi_MoM_l", 1:nlag_price, collapse = " + "), " + ",
+        paste0("IP_MoM_l", 1:nlag_control, collapse = " + "),
+        " | sector^war_dummy + month_name"
+        ))
+
+      feols(fml, data = d, vcov = ~ date)
+    }
+
+    H <- 24 # e.g., 2 years
+    mods[[i]] <- setNames(map(0:H, estimate_lp), 0:H)
+
+    irf_di <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di_war_inv")) %>%   # sector-specific di coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di_war_inv")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=0)
+    })
+
+    irf_di_int <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di_war$")) %>%   # sector-specific di_int coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di_war")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=1)
+    })
+
+    irf_di$sector <- substr(irf_di$sector,str_locate(irf_di$sector,"::")[,2]+1,str_length(irf_di$sector))
+    irf_di_int$sector <- substr(irf_di_int$sector,str_locate(irf_di_int$sector,"::")[,2]+1,str_length(irf_di_int$sector))
+    irf_w_names[[i]] <- irf_di %>%
+      rbind(irf_di_int) %>%
+      mutate(sector=ifelse(sector==1,"war related","non-related to war"))
+  }
+
+for (i in alternative_explanatory_variables) {
+    a <- summary(mods[[i]][["24"]])
+    print(a)
+}
+
+for (i in alternative_explanatory_variables) {
+    a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate, color=factor(post2022), fill=factor(post2022))) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    facet_wrap(~ sector) +
+    theme(legend.position = "bottom") +
+    labs(x = "Horizon (months)", y = paste0("Cumulative ", dependent, " response (%)")) +
+    theme(legend.position = "bottom")  +
+    theme(
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10)
+    ) +
+    scale_fill_manual(values = c("0" = "green", "1" = "darkblue"),
+                      labels = c("Before March 2022", "March 2022 onward"), name = NULL) +
+    scale_color_manual(
+      name = NULL, labels = c("Before March 2022", "March 2022 onward"),
+      values = c(
+        "0" = "green",
+        "1" = "darkblue"
+      )
+    )
+    print(a)
+    ggsave(paste0("graphs/",dependent,"_sector_war_related_",i,".png"), a, width = 12, height = 8, dpi = 150)
+  }
+}
+```
+
+## 4.7) Government ownership
+
+```{r}
+for (dependent in c("PPI", "IPI")) {
+  df_main <- df_panel %>% rename(sector = OKVED2, date = month_start) %>%
+    mutate(dp = if (dependent == "PPI") ppi_MoM else IP_MoM,
+           p_levels = if (dependent == "PPI") log(ppi_levels) else log(IP_levels))
+for (moderating_variable in "state_rev_share_factor") {
+
+irf <- list()
+irf_w_names <- list()
+mods <- list()
+
+  for (i in alternative_explanatory_variables) {
+     df <- df_main %>% rename(di = all_of(i)) %>%
+       mutate(state_rev_share_factor = ifelse(state_part_rev_share_avg_2 >= 0.15, "high", "low"))
+     df$moderator <- df[[moderating_variable]]
+
+    df <- df %>% arrange(sector, date) %>% group_by(sector) %>%
+      mutate(di_war = di * war_dummy, di_war_inv = di * (1 - war_dummy),
+             USDRUB_MoM_int = USDRUB_MoM * war_dummy,
+             wage_MoM = 100 * (log(wage_nominal) - lag(log(wage_nominal))),
+             wage_MoM_int = wage_MoM * war_dummy) %>%
+      add_lags(c("dp", "p_levels", "di", "di_war", "di_war_inv",
+                 "ppi_MoM", "IP_MoM", "USDRUB_MoM_int", "wage_MoM", "wage_MoM_int")) %>%
+      ungroup()
+
+    estimate_lp <- function(h) {
+        d <- df %>%
+        group_by(sector) %>%
+        mutate(dp_lead = dplyr::lead(p_levels, h)) %>%
+        mutate(dp_longdif = 100 * (dp_lead - p_levels_l1)) %>%
+        ungroup() %>%
+        filter(!is.na(dp_lead))
+
+        fml <- as.formula(paste0(
+
+        "dp_longdif ~ i(moderator,di_war_inv) + i(moderator,di_war) + inf_exp_MoM_SA +",
+
+        paste0("di_war_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("di_war_inv_l", 1:nlag_ir, collapse = " + "), " + ",
+        paste0("ctot_export_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("unemp_MoM_SA_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("inf_exp_MoM_SA_l", 1:nlag_control, collapse = " + ")," + ",
+        paste0("USDRUB_MoM_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("USDRUB_MoM_int_l", 1:nlag_control, collapse = " + "), " + ",
+        paste0("ppi_MoM_l", 1:nlag_price, collapse = " + "),
+        " + ", paste0("IP_MoM_l", 1:nlag_control, collapse = " + "),
+        " | sector^war_dummy + month_name"
+        ))
+
+      feols(fml, data = d, vcov = ~ date)
+    }
+
+    H <- 24 # e.g., 2 years
+    mods[[i]] <- setNames(map(0:H, estimate_lp), 0:H)
+
+    irf_di <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di_war_inv")) %>%   # sector-specific di coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di_war_inv")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=0)
+    })
+
+    irf_di_int <- map2_dfr(mods[[i]], 0:H, \(m, h) {
+      tidy(m, conf.int = TRUE, conf.level=confidence) %>%
+        filter(str_detect(term, ":di_war$")) %>%   # sector-specific di_int coefficients
+        mutate(
+          h = h,
+          sector = str_remove(term, ":di_war")
+        ) %>%
+        select(h, sector, estimate, conf.low, conf.high) %>%
+        mutate(post2022=1)
+    })
+
+    irf_di$sector <- substr(irf_di$sector,str_locate(irf_di$sector,"::")[,2]+1,str_length(irf_di$sector))
+    irf_di_int$sector <- substr(irf_di_int$sector,str_locate(irf_di_int$sector,"::")[,2]+1,str_length(irf_di_int$sector))
+    irf_w_names[[i]] <- irf_di %>%
+      rbind(irf_di_int)
+  }
+
+for (i in alternative_explanatory_variables) {
+    a <- summary(mods[[i]][["24"]])
+    print(a)
+}
+
+for (i in alternative_explanatory_variables) {
+    a <- ggplot(irf_w_names[[i]], aes(x = h, y = estimate, color=factor(post2022), fill=factor(post2022))) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+    facet_wrap(~ sector) +
+    theme(legend.position = "bottom") +
+    labs(x = "Horizon (months)", y = paste0("Cumulative ", dependent, " response (%)")) +
+    theme(legend.position = "bottom")  +
+    theme(
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10)
+    ) +
+    scale_fill_manual(values = c("0" = "green", "1" = "darkblue"),
+                      labels = c("Before March 2022", "March 2022 onward"), name = NULL) +
+    scale_color_manual(
+      name = NULL, labels = c("Before March 2022", "March 2022 onward"),
+      values = c(
+        "0" = "green",
+        "1" = "darkblue"
+      )
+    )
+    print(a)
+
+    ggsave(paste0("graphs/",dependent,"_sector_",moderating_variable,"_",i,".png"), a, width = 12, height = 8, dpi = 150)
+
+  }
+}
+}
+```
+

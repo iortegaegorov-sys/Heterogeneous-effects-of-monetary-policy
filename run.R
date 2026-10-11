@@ -1,0 +1,6 @@
+script <- tempfile(fileext = ".R")
+knitr::purl("Regressions.Rmd", output = script, quiet = TRUE)
+pdf(NULL)
+source(script)
+dev.off()
+writeLines(capture.output(sessionInfo()), "results/sessionInfo.txt")
